@@ -1,16 +1,11 @@
-// SQLite persistence for the canvas Maps (elements / snapshots / files).
+// Persistence for the canvas Maps (elements / snapshots / files).
 //
-// Design notes:
-// - Uses the built-in `node:sqlite` (Node >= 22) so there is no new dependency.
-// - Single-file store, one JSON blob per Map under a `kv` table — the canvas is
-//   a single-user scene, so whole-scene writes (debounced) are simple and
-//   reliably consistent compared to per-element row syncing.
-// - The database is opened LAZILY on first write (or explicit hydrate), so
-//   processes that merely import `types.ts` (MCP stdio server, CLI) never
-//   touch the file and can never fight the canvas process for locks.
-// - Canvas stays fully functional if persistence fails (logged, degraded to
-//   in-memory behaviour), matching the upstream "in-memory by design" spirit.
-import { DatabaseSync } from 'node:sqlite';
+// Two backends, chosen at startup:
+// - SQLite (node:sqlite, Node >= 22.5) when available — preferred.
+// - JSON file fallback (~/.excalidraw-canvas/canvas.json) for older runtimes.
+// Both store the whole scene as one blob (single-user canvas), debounced.
+// The store opens LAZILY so processes that merely import types.ts (MCP stdio,
+// CLI) never touch the disk. Canvas stays functional if persistence fails.
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -18,148 +13,122 @@ import logger from '../utils/logger.js';
 
 const FLUSH_DEBOUNCE_MS = 300;
 
-export interface PersistenceHandle {
-  /** Load the stored JSON for this key back into the given Map. */
-  hydrate: (map: Map<string, unknown>) => void;
-  /** Mark this key dirty and schedule a debounced flush. */
-  markDirty: () => void;
-}
-
-interface RegisteredMap {
-  key: string;
-  map: Map<string, unknown>;
-  dirty: boolean;
-}
-
+interface RegisteredMap { key: string; map: Map<string, unknown>; dirty: boolean }
 const registered: RegisteredMap[] = [];
-let db: DatabaseSync | null = null;
+
+let db: import('node:sqlite').DatabaseSync | null = null;
+let sqliteOK = false;
+let probed = false;
 let flushTimer: NodeJS.Timeout | null = null;
 
-function dbPath(): string {
-  const dir = process.env.EXCALIDRAW_DB_DIR || path.join(os.homedir(), '.excalidraw-canvas');
-  return path.join(dir, 'canvas.db');
+function dataDir(): string {
+  return process.env.EXCALIDRAW_DB_DIR || path.join(os.homedir(), '.excalidraw-canvas');
 }
+function jsonPath(): string { return path.join(dataDir(), 'canvas.json'); }
 
-function openDb(): DatabaseSync | null {
-  if (db) return db;
+async function probe(): Promise<void> {
+  if (probed) return;
+  probed = true;
   try {
-    const file = dbPath();
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    db = new DatabaseSync(file);
+    const mod = await import('node:sqlite');
+    const DatabaseSync = mod.DatabaseSync;
+    fs.mkdirSync(dataDir(), { recursive: true });
+    db = new DatabaseSync(dbFile());
     db.exec('PRAGMA journal_mode = WAL;');
     db.exec('CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
-    return db;
-  } catch (error) {
-    logger.error('Persistence: cannot open SQLite store, running in-memory only:', error);
-    db = null;
-    return null;
+    sqliteOK = true;
+    logger.info('Persistence: backend = sqlite');
+  } catch {
+    sqliteOK = false;
+    try { fs.mkdirSync(dataDir(), { recursive: true }); } catch { /* in-memory only */ }
+    logger.info('Persistence: node:sqlite unavailable, backend = json file');
   }
 }
 
-function serialize(map: Map<string, unknown>): string {
-  return JSON.stringify(Array.from(map.entries()));
-}
-
-function flushNow(): void {
-  if (flushTimer) {
-    clearTimeout(flushTimer);
-    flushTimer = null;
-  }
-  const dirty = registered.filter(r => r.dirty);
-  if (dirty.length === 0) return;
-  const store = openDb();
-  if (!store) {
-    dirty.forEach(r => (r.dirty = false));
-    return;
-  }
+function flushSqlite(dirty: RegisteredMap[]): void {
+  const store = db!;
   try {
     store.exec('BEGIN');
     const upsert = store.prepare('INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value');
-    for (const r of dirty) {
-      upsert.run(r.key, serialize(r.map));
-      r.dirty = false;
-    }
+    for (const r of dirty) { upsert.run(r.key, JSON.stringify(Array.from(r.map.entries()))); r.dirty = false; }
     store.exec('COMMIT');
   } catch (error) {
-    try { store.exec('ROLLBACK'); } catch { /* already rolled back */ }
-    logger.error('Persistence: flush failed (canvas keeps running in memory):', error);
+    try { store.exec('ROLLBACK'); } catch { /* noop */ }
+    logger.error('Persistence: sqlite flush failed:', error);
     dirty.forEach(r => (r.dirty = false));
   }
+}
+
+function readJsonBlob(): Record<string, unknown> {
+  return fs.existsSync(jsonPath()) ? JSON.parse(fs.readFileSync(jsonPath(), 'utf8')) : {};
+}
+
+function flushJson(dirty: RegisteredMap[]): void {
+  try {
+    const data = readJsonBlob();
+    for (const r of dirty) { data[r.key] = Array.from(r.map.entries()); r.dirty = false; }
+    const tmp = jsonPath() + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(data));
+    fs.renameSync(tmp, jsonPath());
+  } catch (error) {
+    logger.error('Persistence: json flush failed:', error);
+    dirty.forEach(r => (r.dirty = false));
+  }
+}
+
+function flushNow(): void {
+  if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+  const dirty = registered.filter(r => r.dirty);
+  if (dirty.length === 0 || !probed) return;
+  if (sqliteOK) flushSqlite(dirty); else flushJson(dirty);
 }
 
 function scheduleFlush(): void {
   if (flushTimer) return;
   flushTimer = setTimeout(flushNow, FLUSH_DEBOUNCE_MS);
-  // Don't hold the process open just for a pending flush; the explicit
-  // shutdown flush in server.ts covers exit-time durability.
   flushTimer.unref();
 }
 
-/**
- * Create a Map whose mutations are tracked and (debounced) persisted.
- * Drop-in replacement for `new Map()` in types.ts.
- */
 export function createPersistentMap<K, V>(key: string): Map<K, V> {
   const store: RegisteredMap = { key, map: new Map<K, V>() as Map<string, unknown>, dirty: false };
   registered.push(store as unknown as RegisteredMap);
-
   const map = store.map as Map<K, V>;
-  const originalSet = map.set.bind(map);
-  const originalDelete = map.delete.bind(map);
-  const originalClear = map.clear.bind(map);
-
-  map.set = (...args: Parameters<typeof originalSet>) => {
-    const result = originalSet(...(args as [K, V]));
-    store.dirty = true;
-    scheduleFlush();
-    return result;
-  };
-  map.delete = (k: K) => {
-    const result = originalDelete(k);
-    if (result) {
-      store.dirty = true;
-      scheduleFlush();
-    }
-    return result;
-  };
-  map.clear = () => {
-    originalClear();
-    store.dirty = true;
-    scheduleFlush();
-  };
+  const origSet = map.set.bind(map), origDelete = map.delete.bind(map), origClear = map.clear.bind(map);
+  map.set = (...a: Parameters<typeof origSet>) => { const r = origSet(...(a as [K, V])); store.dirty = true; scheduleFlush(); return r; };
+  map.delete = (k: K) => { const r = origDelete(k); if (r) { store.dirty = true; scheduleFlush(); } return r; };
+  map.clear = () => { origClear(); store.dirty = true; scheduleFlush(); };
   return map;
 }
 
-/**
- * Load persisted state back into the registered Maps. Called once at canvas
- * server startup, before the HTTP listener accepts traffic.
- */
-export function hydratePersistence(): void {
-  const store = openDb();
-  if (!store) return;
+export async function hydratePersistence(): Promise<void> {
+  await probe();
   try {
-    const rows = store.prepare('SELECT key, value FROM kv').all() as { key: string; value: string }[];
-    for (const row of rows) {
-      const target = registered.find(r => r.key === row.key);
-      if (!target) continue;
-      try {
-        const entries = JSON.parse(row.value) as [string, unknown][];
-        target.map.clear();
-        for (const [k, v] of entries) target.map.set(k, v);
-        target.dirty = false;
-        logger.info(`Persistence: restored ${entries.length} ${row.key}`);
-      } catch (error) {
-        logger.warn(`Persistence: corrupted JSON for key "${row.key}", starting empty:`, error);
+    const entriesFor = (key: string): [string, unknown][] | null => {
+      if (sqliteOK && db) {
+        const row = db.prepare('SELECT value FROM kv WHERE key = ?').get(key) as { value: string } | undefined;
+        return row ? JSON.parse(row.value) : null;
       }
+      if (fs.existsSync(jsonPath())) {
+        const data = readJsonBlob();
+        return (data[key] as [string, unknown][]) ?? null;
+      }
+      return null;
+    };
+    for (const r of registered) {
+      const entries = entriesFor(r.key);
+      if (!entries) continue;
+      try {
+        r.map.clear();
+        for (const [k, v] of entries) r.map.set(k, v);
+        r.dirty = false;
+        logger.info(`Persistence: restored ${entries.length} ${r.key}`);
+      } catch (error) { logger.warn(`Persistence: corrupt "${r.key}", starting empty:`, error); }
     }
-  } catch (error) {
-    logger.warn('Persistence: hydrate failed, starting empty:', error);
-  }
+  } catch (error) { logger.warn('Persistence: hydrate failed, starting empty:', error); }
 }
 
-/** Synchronous flush for process shutdown paths. */
 export function flushPersistenceNow(): void {
   flushNow();
-  try { db?.close(); } catch { /* already closed */ }
+  try { db?.close(); } catch { /* noop */ }
   db = null;
 }

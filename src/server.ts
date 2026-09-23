@@ -1377,7 +1377,7 @@ server.on('error', (error: NodeJS.ErrnoException) => {
 async function startServer(): Promise<void> {
   // Restore persisted canvas state (elements/snapshots/files) before the
   // listener accepts traffic, so the first request already sees the scene.
-  hydratePersistence();
+  await hydratePersistence();
 
   if (LOOPBACK_GUARD_HOSTS.has(HOST)) {
     const existingHost = await findExistingLoopbackListener(PORT);
