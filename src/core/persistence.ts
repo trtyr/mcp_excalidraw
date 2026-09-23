@@ -25,6 +25,7 @@ function dataDir(): string {
   return process.env.EXCALIDRAW_DB_DIR || path.join(os.homedir(), '.excalidraw-canvas');
 }
 function jsonPath(): string { return path.join(dataDir(), 'canvas.json'); }
+function dbFile(): string { return path.join(dataDir(), 'canvas.db'); }
 
 async function probe(): Promise<void> {
   if (probed) return;
