@@ -1,6 +1,16 @@
 import logger from '../utils/logger.js';
 import { ServerElement } from '../types.js';
 import { EXPRESS_SERVER_URL, ENABLE_CANVAS_SYNC } from './config.js';
+import { internalSecret } from './auth.js';
+
+// Attach the per-process internal secret so the canvas's own API calls pass
+// the single-token auth gate (see core/auth.ts). External callers are
+// unaffected — they must use the public EXCALIDRAW_AUTH_TOKEN.
+function internalInit(init?: RequestInit): RequestInit {
+  const headers = new Headers(init?.headers);
+  headers.set('Authorization', `Bearer ${internalSecret()}`);
+  return { ...init, headers };
+}
 
 // API Response types
 export interface ApiResponse {
@@ -69,7 +79,7 @@ export async function syncToCanvas(operation: string, data: any): Promise<SyncRe
     await assertCanvasIdentity();
 
     logger.debug(`Syncing to canvas: ${operation}`, { url, data });
-    const response = await fetch(url, options);
+    const response = await fetch(url, internalInit(options));
 
     // Parse JSON response regardless of HTTP status
     const result = await response.json() as ApiResponse;
@@ -128,7 +138,7 @@ export async function getElementFromCanvas(elementId: string): Promise<ServerEle
 
   try {
     await assertCanvasIdentity();
-    const response = await fetch(`${EXPRESS_SERVER_URL}/api/elements/${elementId}`);
+    const response = await fetch(`${EXPRESS_SERVER_URL}/api/elements/${elementId}`, internalInit());
     if (!response.ok) {
       logger.warn(`Failed to fetch element ${elementId}: ${response.status}`);
       return null;
@@ -145,7 +155,7 @@ export async function getElementFromCanvas(elementId: string): Promise<ServerEle
 
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   await assertCanvasIdentity();
-  const response = await fetch(`${EXPRESS_SERVER_URL}${path}`, init);
+  const response = await fetch(`${EXPRESS_SERVER_URL}${path}`, internalInit(init));
   const data = await response.json().catch(() => null) as any;
   if (!response.ok) {
     throw new Error(data?.error || `HTTP server error: ${response.status} ${response.statusText}`);

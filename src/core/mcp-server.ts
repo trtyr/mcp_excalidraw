@@ -4,6 +4,7 @@ import logger from '../utils/logger.js';
 import { packageVersion } from './version.js';
 import { tools } from './mcp-tools.js';
 import { callExcalidrawTool } from './mcp-dispatch.js';
+import { progressiveTool, callProgressive, progressiveToolsEnabled } from './mcp-progressive.js';
 
 const SERVER_NAME = 'mcp-excalidraw-server';
 const SERVER_DESCRIPTION =
@@ -43,23 +44,37 @@ export function createExcalidrawMcpServer(ctx?: McpRequestContext): McpServer {
     }
   );
 
-  for (const tool of tools) {
+  if (progressiveToolsEnabled()) {
+    // Progressive-disclosure surface: one entry tool, capability map via
+    // discover, parameter manuals via help, direct routing otherwise.
     server.registerTool(
-      tool.name,
+      progressiveTool.name,
       {
-        ...(tool.description !== undefined ? { description: tool.description } : {}),
-        // `Tool['inputSchema']` is the spec's open JSON value shape; the
-        // validator wants a JSON Schema. The tool table above is the authority
-        // for both, so reuse it verbatim rather than re-authoring the schemas.
-        inputSchema: fromJsonSchema<Record<string, unknown>>(tool.inputSchema as JsonSchemaType)
+        ...(progressiveTool.description !== undefined ? { description: progressiveTool.description } : {}),
+        inputSchema: fromJsonSchema<Record<string, unknown>>(progressiveTool.inputSchema as JsonSchemaType)
       },
-      async (args: Record<string, unknown>) => callExcalidrawTool(tool.name, args)
+      async (args: Record<string, unknown>) => callProgressive(args)
     );
+  } else {
+    for (const tool of tools) {
+      server.registerTool(
+        tool.name,
+        {
+          ...(tool.description !== undefined ? { description: tool.description } : {}),
+          // `Tool['inputSchema']` is the spec's open JSON value shape; the
+          // validator wants a JSON Schema. The tool table above is the authority
+          // for both, so reuse it verbatim rather than re-authoring the schemas.
+          inputSchema: fromJsonSchema<Record<string, unknown>>(tool.inputSchema as JsonSchemaType)
+        },
+        async (args: Record<string, unknown>) => callExcalidrawTool(tool.name, args)
+      );
+    }
   }
 
   logger.debug('Built Excalidraw MCP server instance', {
     era: ctx?.era ?? 'unknown',
-    toolCount: tools.length
+    toolCount: progressiveToolsEnabled() ? 1 : tools.length,
+    surface: progressiveToolsEnabled() ? 'progressive' : 'legacy'
   });
 
   return server;

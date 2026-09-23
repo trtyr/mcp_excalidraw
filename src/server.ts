@@ -1,7 +1,7 @@
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import { WebSocketServer } from 'ws';
-import { createServer } from 'http';
+import { createServer, IncomingMessage } from 'http';
 import net from 'net';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -30,6 +30,9 @@ import { z } from 'zod';
 import WebSocket from 'ws';
 import { isMainModule } from './core/entry.js';
 import { writePidFile, removePidFile } from './core/pidfile.js';
+import { mcpHttpEndpoint } from './core/mcp-http.js';
+import { hydratePersistence, flushPersistenceNow } from './core/persistence.js';
+import { requireToken, verifyWebSocketUpgrade } from './core/auth.js';
 
 // Load environment variables
 dotenv.config();
@@ -39,10 +42,19 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const server = createServer(app);
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({
+  server,
+  verifyClient: (info: { req: IncomingMessage }) => verifyWebSocketUpgrade(info.req)
+});
 
 // Middleware
 app.use(cors());
+// Auth gate for /mcp + /api/* (no-op when EXCALIDRAW_AUTH_TOKEN is unset).
+// Must precede the MCP endpoint and express.json (body must stay intact).
+app.use(requireToken);
+// MCP streamable-HTTP endpoint — must precede express.json so the raw
+// request stream stays intact for the MCP transport to read the body.
+app.use('/mcp', mcpHttpEndpoint);
 app.use(express.json({ limit: '10mb' }));
 
 // Serve static files from the build directory
@@ -1363,6 +1375,10 @@ server.on('error', (error: NodeJS.ErrnoException) => {
 });
 
 async function startServer(): Promise<void> {
+  // Restore persisted canvas state (elements/snapshots/files) before the
+  // listener accepts traffic, so the first request already sees the scene.
+  hydratePersistence();
+
   if (LOOPBACK_GUARD_HOSTS.has(HOST)) {
     const existingHost = await findExistingLoopbackListener(PORT);
     if (existingHost) {
@@ -1393,6 +1409,7 @@ async function startServer(): Promise<void> {
 
   const shutdown = (signal: NodeJS.Signals): void => {
     logger.info(`Received ${signal}, shutting down canvas server`);
+    flushPersistenceNow();
     if (ownsPidFile) removePidFile(PORT);
     server.close(() => process.exit(0));
     // Force-exit if open sockets keep the server from closing promptly

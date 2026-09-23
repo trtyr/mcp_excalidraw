@@ -1,3 +1,5 @@
+import { createPersistentMap } from './core/persistence.js';
+
 export interface ExcalidrawElementBase {
   id: string;
   type: ExcalidrawElementType;
@@ -284,11 +286,11 @@ export interface Snapshot {
   createdAt: string;
 }
 
-// In-memory storage for Excalidraw elements
-export const elements = new Map<string, ServerElement>();
+// Persistent in-memory storage for Excalidraw elements (SQLite-backed Map)
+export const elements = createPersistentMap<string, ServerElement>('elements');
 
-// In-memory storage for snapshots
-export const snapshots = new Map<string, Snapshot>();
+// Persistent in-memory storage for snapshots
+export const snapshots = createPersistentMap<string, Snapshot>('snapshots');
 
 // In-memory file storage for image elements (Excalidraw BinaryFiles)
 export interface ExcalidrawFile {
@@ -297,7 +299,7 @@ export interface ExcalidrawFile {
   mimeType: string;
   created: number;
 }
-export const files = new Map<string, ExcalidrawFile>();
+export const files = createPersistentMap<string, ExcalidrawFile>('files');
 
 // Validation function for Excalidraw elements
 export function validateElement(element: Partial<ServerElement>): element is ServerElement {
