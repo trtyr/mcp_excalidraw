@@ -31,21 +31,23 @@ export function authToken(): string | null {
   return trimmed ? trimmed : null;
 }
 
-function extractToken(req: { headers: IncomingMessage['headers']; query?: Record<string, unknown> }): string | null {
+function extractTokenCandidates(req: { headers: IncomingMessage['headers']; query?: Record<string, unknown> }): string[] {
+  const candidates: string[] = [];
   const auth = req.headers.authorization;
   if (auth && auth.startsWith('Bearer ')) {
-    return auth.slice('Bearer '.length).trim() || null;
+    const bearer = auth.slice('Bearer '.length).trim();
+    if (bearer) candidates.push(bearer);
   }
   const cookieHeader = req.headers.cookie;
   if (cookieHeader) {
     for (const pair of cookieHeader.split(';')) {
       const [name, ...rest] = pair.trim().split('=');
-      if (name === COOKIE_NAME) return decodeURIComponent(rest.join('='));
+      if (name === COOKIE_NAME) candidates.push(decodeURIComponent(rest.join('=')));
     }
   }
   const q = (req.query as { token?: unknown } | undefined)?.token;
-  if (typeof q === 'string' && q.length > 0) return q;
-  return null;
+  if (typeof q === 'string' && q.length > 0) candidates.push(q);
+  return candidates;
 }
 
 function constantTimeEqual(a: string, b: string): boolean {
@@ -71,12 +73,15 @@ export function requireToken(req: Request, res: Response, next: NextFunction): v
     next();
     return;
   }
-  const got = extractToken(req);
-  if (got && constantTimeEqual(got, internalSecret())) {
+  // Accept ANY presented credential (Bearer / cookie / ?token=). A stale
+  // cookie must not shadow a valid ?token= — otherwise a token rotation
+  // locks still-open browsers out for the cookie's remaining lifetime.
+  const candidates = extractTokenCandidates(req);
+  if (candidates.some(got => constantTimeEqual(got, internalSecret()))) {
     next();
     return;
   }
-  if (got && constantTimeEqual(got, expected)) {
+  if (candidates.some(got => constantTimeEqual(got, expected))) {
     // First browser visit via ?token= — hand back a cookie so subsequent
     // /api/* calls and the WebSocket upgrade authenticate automatically.
     const viaQuery = typeof (req.query as { token?: unknown })?.token === 'string';
@@ -104,8 +109,11 @@ export function requireToken(req: Request, res: Response, next: NextFunction): v
 export function verifyWebSocketUpgrade(req: IncomingMessage): boolean {
   const expected = authToken();
   if (!expected) return true;
-  const got = extractToken({ headers: req.headers, query: reqUrlQuery(req) });
-  return !!got && constantTimeEqual(got, expected);
+  // Any credential wins (Bearer / cookie / ?token=) — same rationale as
+  // requireToken: a stale cookie must not shadow a fresh ?token=.
+  const candidates = extractTokenCandidates({ headers: req.headers, query: reqUrlQuery(req) });
+  if (candidates.some(got => constantTimeEqual(got, internalSecret()))) return true;
+  return candidates.some(got => constantTimeEqual(got, expected));
 }
 
 function reqUrlQuery(req: IncomingMessage): Record<string, string> {
