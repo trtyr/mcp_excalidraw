@@ -286,11 +286,10 @@ export interface Snapshot {
   createdAt: string;
 }
 
-// Persistent in-memory storage for Excalidraw elements (SQLite-backed Map)
-export const elements = createPersistentMap<string, ServerElement>('elements');
-
-// Persistent in-memory storage for snapshots
-export const snapshots = createPersistentMap<string, Snapshot>('snapshots');
+// Element/snapshot/file storage is scene-scoped since the multi-canvas
+// upgrade — see src/core/scenes.ts (getSceneMaps). The old global maps
+// (kv keys `elements`/`snapshots`/`files`) are migrated to
+// `scene:default:*` at startup by persistence.migrateLegacySceneKeys().
 
 // In-memory file storage for image elements (Excalidraw BinaryFiles)
 export interface ExcalidrawFile {
@@ -299,7 +298,6 @@ export interface ExcalidrawFile {
   mimeType: string;
   created: number;
 }
-export const files = createPersistentMap<string, ExcalidrawFile>('files');
 
 // Validation function for Excalidraw elements
 export function validateElement(element: Partial<ServerElement>): element is ServerElement {

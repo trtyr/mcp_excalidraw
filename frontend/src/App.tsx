@@ -175,17 +175,22 @@ function App(): JSX.Element {
     }
   }, [excalidrawAPI])
 
+  // Multi-canvas: /<scene> path targets that canvas; / is the default.
+  const pathScene = window.location.pathname.replace(/^\/+/, '').split('/')[0];
+  const SCENE = /^[a-zA-Z0-9_-]{1,64}$/.test(pathScene) ? pathScene : '';
+  const apiPath = (p: string): string => (SCENE ? p.replace(/^\/api(?=\/|$)/, `/api/s/${SCENE}`) : p);
+
   const loadExistingElements = async (): Promise<void> => {
     if (!excalidrawAPIRef.current) return
     const generation = pauseSceneSync()
     try {
-      const response = await fetch('/api/elements', { signal: AbortSignal.timeout(10000) })
+      const response = await fetch(apiPath('/api/elements'), { signal: AbortSignal.timeout(10000) })
       const result: ApiResponse = await response.json()
       if (generation !== sceneGenerationRef.current) return
       if (!response.ok || !result.success || !Array.isArray(result.elements)) {
         throw new Error(result.error || 'Invalid scene response')
       }
-      const filesResponse = await fetch('/api/files', { signal: AbortSignal.timeout(10000) })
+      const filesResponse = await fetch(apiPath('/api/files'), { signal: AbortSignal.timeout(10000) })
       const filesResult = await filesResponse.json() as ApiResponse
       if (generation !== sceneGenerationRef.current) return
       if (!filesResponse.ok || !filesResult.files) {
@@ -208,7 +213,7 @@ function App(): JSX.Element {
     }
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const wsUrl = `${protocol}//${window.location.host}`
+    const wsUrl = `${protocol}//${window.location.host}${SCENE ? '/?scene=' + encodeURIComponent(SCENE) : ''}`
 
     const socket = new WebSocket(wsUrl)
     websocketRef.current = socket
@@ -632,7 +637,7 @@ function App(): JSX.Element {
       const backendElements = activeElements.map(convertToBackendFormat)
 
       // 4. Send to backend
-      const response = await fetch('/api/elements/sync', {
+      const response = await fetch(apiPath('/api/elements/sync'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -697,7 +702,7 @@ function App(): JSX.Element {
     if (!canSyncScene()) return
     const generation = pauseSceneSync()
     try {
-      const response = await fetch('/api/elements/clear', {
+      const response = await fetch(apiPath('/api/elements/clear'), {
         method: 'DELETE', signal: AbortSignal.timeout(10000)
       })
       if (!response.ok) throw new Error('Could not clear the saved canvas')

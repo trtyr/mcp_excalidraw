@@ -103,6 +103,7 @@ export function createPersistentMap<K, V>(key: string): Map<K, V> {
 
 export async function hydratePersistence(): Promise<void> {
   await probe();
+  migrateLegacySceneKeys();
   try {
     const entriesFor = (key: string): [string, unknown][] | null => {
       if (sqliteOK && db) {
@@ -132,4 +133,99 @@ export function flushPersistenceNow(): void {
   flushNow();
   try { db?.close(); } catch { /* noop */ }
   db = null;
+}
+
+// ---- Multi-scene primitives (scene:<name>:* keys) ----
+
+/** Read persisted entries for an arbitrary kv key (null when absent). */
+export function readPersistedEntries(key: string): [string, unknown][] | null {
+  try {
+    if (sqliteOK && db) {
+      const row = db.prepare('SELECT value FROM kv WHERE key = ?').get(key) as { value: string } | undefined;
+      return row ? JSON.parse(row.value) : null;
+    }
+    if (fs.existsSync(jsonPath())) {
+      const data = readJsonBlob();
+      return (data[key] as [string, unknown][]) ?? null;
+    }
+  } catch { /* fallthrough */ }
+  return null;
+}
+
+/** Hard-delete a kv key (and any registered live map for it). Used by scene purge + legacy migration. */
+export function deletePersistedKey(key: string): void {
+  try {
+    if (sqliteOK && db) {
+      db.prepare('DELETE FROM kv WHERE key = ?').run(key);
+    } else if (fs.existsSync(jsonPath())) {
+      const data = readJsonBlob();
+      if (key in data) { delete data[key]; fs.writeFileSync(jsonPath() + '.tmp', JSON.stringify(data)); fs.renameSync(jsonPath() + '.tmp', jsonPath()); }
+    }
+  } catch (error) { logger.error(`Persistence: delete key "${key}" failed:`, error); }
+  const idx = registered.findIndex(r => r.key === key);
+  if (idx >= 0) registered.splice(idx, 1);
+}
+
+function writePersistedEntriesRaw(key: string, entries: [string, unknown][]): void {
+  const json = JSON.stringify(entries);
+  if (sqliteOK && db) {
+    db.prepare('INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, json);
+  } else {
+    const data = readJsonBlob();
+    data[key] = entries;
+    fs.writeFileSync(jsonPath() + '.tmp', JSON.stringify(data));
+    fs.renameSync(jsonPath() + '.tmp', jsonPath());
+  }
+}
+
+/**
+ * One-time lossless migration: legacy top-level keys (elements/snapshots/files)
+ * → scene:default:*. Idempotent — no legacy keys, no action.
+ * Legacy reads cross BOTH backends (a JSON-era install upgrading on Node ≥22.5
+ * flips the active backend to sqlite — the json file must still be found,
+ * migrated, and cleaned).
+ */
+export function migrateLegacySceneKeys(): void {
+  const LEGACY = ['elements', 'snapshots', 'files'] as const;
+  const readAny = (key: string): [string, unknown][] | null => {
+    try {
+      if (db) {
+        const row = db.prepare('SELECT value FROM kv WHERE key = ?').get(key) as { value: string } | undefined;
+        if (row) return JSON.parse(row.value);
+      }
+    } catch { /* try json */ }
+    try {
+      if (fs.existsSync(jsonPath())) {
+        const v = (readJsonBlob() as Record<string, unknown>)[key];
+        if (v) return v as [string, unknown][];
+      }
+    } catch { /* absent */ }
+    return null;
+  };
+  const deleteAny = (key: string): void => {
+    try { if (db) db.prepare('DELETE FROM kv WHERE key = ?').run(key); } catch { /* noop */ }
+    try {
+      if (fs.existsSync(jsonPath())) {
+        const data = readJsonBlob();
+        if (key in data) {
+          delete data[key];
+          fs.writeFileSync(jsonPath() + '.tmp', JSON.stringify(data));
+          fs.renameSync(jsonPath() + '.tmp', jsonPath());
+        }
+      }
+    } catch { /* noop */ }
+  };
+  const hasLegacy = LEGACY.some(k => readAny(k) !== null);
+  const hasNew = readPersistedEntries('scene:default:elements') !== null;
+  if (!hasLegacy) return; // already migrated (or fresh install)
+  if (hasNew) { // migrated earlier but legacy rows lingered (partial) — just drop them
+    for (const k of LEGACY) deleteAny(k);
+    return;
+  }
+  for (const k of LEGACY) {
+    const entries = readAny(k);
+    if (entries && entries.length > 0) writePersistedEntriesRaw(`scene:default:${k}`, entries);
+    deleteAny(k);
+  }
+  logger.info('Persistence: migrated legacy keys → scene:default:* (multi-canvas upgrade)');
 }

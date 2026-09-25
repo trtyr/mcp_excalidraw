@@ -2,6 +2,17 @@ import logger from '../utils/logger.js';
 import { ServerElement } from '../types.js';
 import { EXPRESS_SERVER_URL, ENABLE_CANVAS_SYNC } from './config.js';
 import { internalSecret } from './auth.js';
+import { AsyncLocalStorage } from 'node:async_hooks';
+
+// Ambient target scene for the current MCP tool call. Explicit trailing
+// `scene` args win; otherwise the ambient value from withScene() applies.
+const sceneCtx = new AsyncLocalStorage<string | undefined>();
+export function withScene<T>(scene: string | undefined, fn: () => T): T {
+  return sceneCtx.run(scene || undefined, fn);
+}
+function resolveScene(explicit?: string): string | undefined {
+  return explicit || sceneCtx.getStore();
+}
 
 // Attach the per-process internal secret so the canvas's own API calls pass
 // the single-token auth gate (see core/auth.ts). External callers are
@@ -10,6 +21,12 @@ function internalInit(init?: RequestInit): RequestInit {
   const headers = new Headers(init?.headers);
   headers.set('Authorization', `Bearer ${internalSecret()}`);
   return { ...init, headers };
+}
+
+// Rewrite /api/... → /api/s/<scene>/... when a target scene is given.
+function scenePath(path: string, scene?: string): string {
+  if (!scene) return path;
+  return path.replace(/^\/api(?=\/|$)/, `/api/s/${scene}`);
 }
 
 // API Response types
@@ -28,7 +45,7 @@ export interface SyncResponse {
 }
 
 // Helper functions to sync with Express server (canvas)
-export async function syncToCanvas(operation: string, data: any): Promise<SyncResponse | null> {
+export async function syncToCanvas(operation: string, data: any, scene?: string): Promise<SyncResponse | null> {
   if (!ENABLE_CANVAS_SYNC) {
     logger.debug('Canvas sync disabled, skipping');
     return null;
@@ -40,7 +57,7 @@ export async function syncToCanvas(operation: string, data: any): Promise<SyncRe
 
     switch (operation) {
       case 'create':
-        url = `${EXPRESS_SERVER_URL}/api/elements`;
+        url = `${EXPRESS_SERVER_URL}${scenePath('/api/elements', resolveScene(scene))}`;
         options = {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -49,7 +66,7 @@ export async function syncToCanvas(operation: string, data: any): Promise<SyncRe
         break;
 
       case 'update':
-        url = `${EXPRESS_SERVER_URL}/api/elements/${data.id}`;
+        url = `${EXPRESS_SERVER_URL}${scenePath('/api/elements', resolveScene(scene))}/${data.id}`;
         options = {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
@@ -58,12 +75,12 @@ export async function syncToCanvas(operation: string, data: any): Promise<SyncRe
         break;
 
       case 'delete':
-        url = `${EXPRESS_SERVER_URL}/api/elements/${data.id}`;
+        url = `${EXPRESS_SERVER_URL}${scenePath('/api/elements', resolveScene(scene))}/${data.id}`;
         options = { method: 'DELETE' };
         break;
 
       case 'batch_create':
-        url = `${EXPRESS_SERVER_URL}/api/elements/batch`;
+        url = `${EXPRESS_SERVER_URL}${scenePath('/api/elements/batch', resolveScene(scene))}`;
         options = {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -103,34 +120,34 @@ export async function syncToCanvas(operation: string, data: any): Promise<SyncRe
 // Sync disabled = deliberate no-op (echo the input, legacy behavior);
 // sync enabled but failed = null, so callers report the failure instead of
 // claiming "synced to canvas" for an element that never landed.
-export async function createElementOnCanvas(elementData: ServerElement): Promise<ServerElement | null> {
+export async function createElementOnCanvas(elementData: ServerElement, scene?: string): Promise<ServerElement | null> {
   if (!ENABLE_CANVAS_SYNC) return elementData;
-  const result = await syncToCanvas('create', elementData);
+  const result = await syncToCanvas('create', elementData, scene);
   return result?.element ?? null;
 }
 
 // Helper to sync element update to canvas
-export async function updateElementOnCanvas(elementData: Partial<ServerElement> & { id: string }): Promise<ServerElement | null> {
-  const result = await syncToCanvas('update', elementData);
+export async function updateElementOnCanvas(elementData: Partial<ServerElement> & { id: string }, scene?: string): Promise<ServerElement | null> {
+  const result = await syncToCanvas('update', elementData, scene);
   return result?.element || null;
 }
 
 // Helper to sync element deletion to canvas
-export async function deleteElementOnCanvas(elementId: string): Promise<any> {
-  const result = await syncToCanvas('delete', { id: elementId });
+export async function deleteElementOnCanvas(elementId: string, scene?: string): Promise<any> {
+  const result = await syncToCanvas('delete', { id: elementId }, scene);
   return result;
 }
 
 // Helper to sync batch creation to canvas (same failure semantics as
 // createElementOnCanvas: disabled = echo, failed = null)
-export async function batchCreateElementsOnCanvas(elementsData: ServerElement[]): Promise<ServerElement[] | null> {
+export async function batchCreateElementsOnCanvas(elementsData: ServerElement[], scene?: string): Promise<ServerElement[] | null> {
   if (!ENABLE_CANVAS_SYNC) return elementsData;
-  const result = await syncToCanvas('batch_create', elementsData);
+  const result = await syncToCanvas('batch_create', elementsData, scene);
   return result?.elements ?? null;
 }
 
 // Helper to fetch element from canvas
-export async function getElementFromCanvas(elementId: string): Promise<ServerElement | null> {
+export async function getElementFromCanvas(elementId: string, scene?: string): Promise<ServerElement | null> {
   if (!ENABLE_CANVAS_SYNC) {
     logger.debug('Canvas sync disabled, skipping fetch');
     return null;
@@ -138,7 +155,7 @@ export async function getElementFromCanvas(elementId: string): Promise<ServerEle
 
   try {
     await assertCanvasIdentity();
-    const response = await fetch(`${EXPRESS_SERVER_URL}/api/elements/${elementId}`, internalInit());
+    const response = await fetch(`${EXPRESS_SERVER_URL}${scenePath(`/api/elements/${elementId}`, resolveScene(scene))}`, internalInit());
     if (!response.ok) {
       logger.warn(`Failed to fetch element ${elementId}: ${response.status}`);
       return null;
@@ -153,9 +170,9 @@ export async function getElementFromCanvas(elementId: string): Promise<ServerEle
 
 // ---- Typed REST wrappers shared by the MCP server and CLI ----
 
-async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
+async function requestJson<T>(path: string, init?: RequestInit, scene?: string): Promise<T> {
   await assertCanvasIdentity();
-  const response = await fetch(`${EXPRESS_SERVER_URL}${path}`, internalInit(init));
+  const response = await fetch(`${EXPRESS_SERVER_URL}${scenePath(path, resolveScene(scene))}`, internalInit(init));
   const data = await response.json().catch(() => null) as any;
   if (!response.ok) {
     throw new Error(data?.error || `HTTP server error: ${response.status} ${response.statusText}`);
@@ -163,117 +180,148 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   return data as T;
 }
 
-export async function getElements(): Promise<ServerElement[]> {
-  const data = await requestJson<ApiResponse>('/api/elements');
+export async function getElements(scene?: string): Promise<ServerElement[]> {
+  const data = await requestJson<ApiResponse>('/api/elements', undefined, scene);
   return data.elements || [];
 }
 
-export async function searchElements(queryParams: URLSearchParams): Promise<ServerElement[]> {
-  const data = await requestJson<ApiResponse>(`/api/elements/search?${queryParams}`);
+export async function searchElements(queryParams: URLSearchParams, scene?: string): Promise<ServerElement[]> {
+  const data = await requestJson<ApiResponse>(`/api/elements/search?${queryParams}`, undefined, scene);
   return data.elements || [];
 }
 
-export async function clearCanvas(): Promise<ApiResponse> {
-  return requestJson<ApiResponse>('/api/elements/clear', { method: 'DELETE' });
+export async function clearCanvas(scene?: string): Promise<ApiResponse> {
+  return requestJson<ApiResponse>('/api/elements/clear', { method: 'DELETE' }, scene);
 }
 
-export async function getFiles(): Promise<Record<string, any>> {
-  const data = await requestJson<{ files?: Record<string, any> }>('/api/files');
+export async function getFiles(scene?: string): Promise<Record<string, any>> {
+  const data = await requestJson<{ files?: Record<string, any> }>('/api/files', undefined, scene);
   return data.files || {};
 }
 
-export async function postFiles(files: any[]): Promise<void> {
+export async function postFiles(files: any[], scene?: string): Promise<void> {
   await requestJson('/api/files', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(files)
-  });
+  }, scene);
 }
 
-export async function exportImage(format: 'png' | 'svg', background = true): Promise<{ success: boolean; format: string; data: string }> {
+export async function exportImage(format: 'png' | 'svg', background = true, scene?: string): Promise<{ success: boolean; format: string; data: string }> {
   return requestJson('/api/export/image', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ format, background })
-  });
+  }, scene);
 }
 
-export async function setViewport(params: Record<string, unknown>): Promise<{ success: boolean; message?: string }> {
+export async function setViewport(params: Record<string, unknown>, scene?: string): Promise<{ success: boolean; message?: string }> {
   return requestJson('/api/viewport', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(params)
-  });
+  }, scene);
 }
 
-export async function saveSnapshot(name: string): Promise<any> {
+export async function saveSnapshot(name: string, scene?: string): Promise<any> {
   return requestJson('/api/snapshots', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name })
-  });
+  }, scene);
 }
 
-export async function listSnapshots(): Promise<{ success: boolean; snapshots: any[]; count: number }> {
-  return requestJson('/api/snapshots');
+export async function listSnapshots(scene?: string): Promise<{ success: boolean; snapshots: any[]; count: number }> {
+  return requestJson('/api/snapshots', undefined, scene);
 }
 
-export async function getSnapshot(name: string): Promise<{ name: string; elements: ServerElement[]; createdAt: string }> {
+export async function getSnapshot(name: string, scene?: string): Promise<{ name: string; elements: ServerElement[]; createdAt: string }> {
   const data = await requestJson<{ success: boolean; snapshot: { name: string; elements: ServerElement[]; createdAt: string } }>(
-    `/api/snapshots/${encodeURIComponent(name)}`
+    `/api/snapshots/${encodeURIComponent(name)}`, undefined, scene
   );
   return data.snapshot;
 }
 
-export async function sendMermaid(mermaidDiagram: string, config?: Record<string, unknown>): Promise<ApiResponse> {
+export async function sendMermaid(mermaidDiagram: string, config?: Record<string, unknown>, scene?: string): Promise<ApiResponse> {
   return requestJson('/api/elements/from-mermaid', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ mermaidDiagram, config })
-  });
+  }, scene);
 }
 
 // ---- Strict CRUD variants (throw on failure) ----
 // syncToCanvas deliberately swallows errors so MCP tools degrade gracefully;
 // the CLI wants hard failures with real error messages instead.
 
-export async function createElementStrict(element: ServerElement): Promise<ServerElement> {
+export async function createElementStrict(element: ServerElement, scene?: string): Promise<ServerElement> {
   const data = await requestJson<ApiResponse>('/api/elements', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(element)
-  });
+  }, scene);
   return data.element!;
 }
 
-export async function updateElementStrict(element: Partial<ServerElement> & { id: string }): Promise<ServerElement> {
+export async function updateElementStrict(element: Partial<ServerElement> & { id: string }, scene?: string): Promise<ServerElement> {
   const data = await requestJson<ApiResponse>(`/api/elements/${element.id}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(element)
-  });
+  }, scene);
   return data.element!;
 }
 
-export async function deleteElementStrict(id: string): Promise<ApiResponse> {
-  return requestJson<ApiResponse>(`/api/elements/${id}`, { method: 'DELETE' });
+export async function deleteElementStrict(id: string, scene?: string): Promise<ApiResponse> {
+  return requestJson<ApiResponse>(`/api/elements/${id}`, { method: 'DELETE' }, scene);
 }
 
-export async function getElementStrict(id: string): Promise<ServerElement> {
-  const data = await requestJson<ApiResponse>(`/api/elements/${id}`);
+export async function getElementStrict(id: string, scene?: string): Promise<ServerElement> {
+  const data = await requestJson<ApiResponse>(`/api/elements/${id}`, undefined, scene);
   if (!data.element) {
     throw new Error(`Element ${id} not found`);
   }
   return data.element;
 }
 
-export async function batchCreateElementsStrict(elements: ServerElement[]): Promise<ServerElement[]> {
+export async function batchCreateElementsStrict(elements: ServerElement[], scene?: string): Promise<ServerElement[]> {
   const data = await requestJson<ApiResponse>('/api/elements/batch', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ elements })
-  });
+  }, scene);
   return data.elements || [];
+}
+
+// ---- Scene (multi-canvas) management via REST ----
+export interface CanvasSceneMeta {
+  name: string;
+  createdAt: string;
+  lastUsedAt: string;
+  deletedAt: string | null;
+}
+
+export async function listCanvases(includeDeleted = true): Promise<CanvasSceneMeta[]> {
+  const data = await requestJson<{ success: boolean; scenes: CanvasSceneMeta[] }>(`/api/scenes?includeDeleted=${includeDeleted}`);
+  return data.scenes || [];
+}
+
+export async function createCanvas(name: string): Promise<CanvasSceneMeta> {
+  const data = await requestJson<{ success: boolean; scene: CanvasSceneMeta }>('/api/scenes', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name })
+  });
+  return data.scene;
+}
+
+export async function deleteCanvas(name: string, purge = false): Promise<{ success: boolean; purged: boolean; name: string }> {
+  return requestJson(`/api/scenes/${encodeURIComponent(name)}${purge ? '?purge=1' : ''}`, { method: 'DELETE' });
+}
+
+export async function restoreCanvas(name: string): Promise<CanvasSceneMeta> {
+  const data = await requestJson<{ success: boolean; scene: CanvasSceneMeta }>(`/api/scenes/${encodeURIComponent(name)}/restore`, { method: 'POST' });
+  return data.scene;
 }
 
 // Identity marker the canvas server puts in /health (v1.1+)

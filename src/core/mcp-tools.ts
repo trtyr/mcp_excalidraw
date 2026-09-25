@@ -1,8 +1,65 @@
 import type { Tool } from '@modelcontextprotocol/server';
 import { EXCALIDRAW_ELEMENT_TYPES } from '../types.js';
 
+// Multi-canvas: every element/file/snapshot/viewport tool accepts an optional
+// `scene` arg selecting the target canvas (omit = default canvas).
+const SCENE_PROPERTY = {
+  type: 'string',
+  description: 'Target canvas (scene) name — omit for the default canvas. Create/list canvases with create_canvas / list_canvases.',
+  pattern: '^[a-zA-Z0-9_-]{1,64}$'
+} as const;
+
+function withSceneProperty(tool: Tool): Tool {
+  const schema = tool.inputSchema as { properties?: Record<string, unknown> };
+  return {
+    ...tool,
+    inputSchema: {
+      ...schema,
+      type: 'object' as const,
+      properties: { ...(schema.properties || {}), scene: SCENE_PROPERTY }
+    } as Tool['inputSchema']
+  };
+}
+
+const CANVAS_TOOLS: Tool[] = [
+  {
+    name: 'create_canvas',
+    description: 'Create a new canvas (scene). Target it from any tool via the scene parameter, or open /<name> in a browser.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Canvas name (letters, digits, -, _; max 64)' }
+      },
+      required: ['name']
+    }
+  },
+  {
+    name: 'list_canvases',
+    description: 'List canvases with metadata (createdAt / lastUsedAt / deletedAt). includeDeleted=false hides the recycle bin.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        includeDeleted: { type: 'boolean', description: 'Include soft-deleted canvases (default true)' }
+      }
+    }
+  },
+  {
+    name: 'delete_canvas',
+    description: 'Delete a canvas. Default: soft-delete to recycle bin (data kept). restore:true brings it back; purge:true wipes it permanently. The default canvas cannot be deleted.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Canvas name' },
+        restore: { type: 'boolean', description: 'Restore from recycle bin instead of deleting' },
+        purge: { type: 'boolean', description: 'Permanently wipe data (cannot be undone)' }
+      },
+      required: ['name']
+    }
+  }
+];
+
 // Tool definitions
-export const tools: Tool[] = [
+const RAW_TOOLS: Tool[] = [
   {
     name: 'create_element',
     description: 'Create a new Excalidraw element. For arrows, use startElementId/endElementId to bind to shapes (auto-routes to edges).',
@@ -482,3 +539,7 @@ export const tools: Tool[] = [
     }
   }
 ];
+
+// Public surface: legacy 26 tools (each + optional scene selector) and the
+// canvas management tools.
+export const tools: Tool[] = [...RAW_TOOLS.map(withSceneProperty), ...CANVAS_TOOLS];

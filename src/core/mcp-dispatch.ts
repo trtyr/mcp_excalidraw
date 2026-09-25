@@ -9,6 +9,13 @@ import {
 } from '../types.js';
 import { EXPRESS_SERVER_URL } from './config.js';
 import {
+  withScene,
+  listCanvases,
+  createCanvas as createCanvasOnServer,
+  deleteCanvas as deleteCanvasOnServer,
+  restoreCanvas as restoreCanvasOnServer
+} from './canvas-client.js';
+import {
   updateElementOnCanvas,
   deleteElementOnCanvas,
   getElementFromCanvas,
@@ -127,7 +134,19 @@ export async function callExcalidrawTool(
     if (toolNeedsCanvasBeforeDispatch(name)) {
       await ensureCanvasReadyForMcpTool();
     }
-    
+
+    // Multi-canvas: an optional `scene` arg on ANY tool targets a specific
+    // canvas; everything downstream (canvas-client) picks it up ambiently.
+    const sceneRaw = (args as { scene?: unknown } | undefined)?.scene;
+    if (sceneRaw !== undefined && typeof sceneRaw !== 'string') {
+      throw new Error('Invalid scene: must be a string');
+    }
+    const sceneArg = typeof sceneRaw === 'string' ? sceneRaw.trim() : undefined;
+    if (sceneArg !== undefined && !/^[a-zA-Z0-9_-]{1,64}$/.test(sceneArg)) {
+      throw new Error(`Invalid scene name "${sceneArg}" (expected ^[a-zA-Z0-9_-]{1,64}$)`);
+    }
+
+    return await withScene(sceneArg, async () => {
     switch (name) {
       case 'create_element': {
         const params = ElementSchema.parse(args);
@@ -711,9 +730,50 @@ export async function callExcalidrawTool(
           }]
         };
       }
+      case 'create_canvas': {
+        const name2 = typeof (args as any)?.name === 'string' ? (args as any).name.trim() : '';
+        if (!name2) throw new Error('Canvas name is required');
+        const scene = await createCanvasOnServer(name2);
+        return {
+          content: [{
+            type: 'text',
+            text: `Canvas "${scene.name}" created.\n\n${JSON.stringify(scene, null, 2)}\n\nPoint tools at it with { "scene": "${scene.name}" } or open /${scene.name} in a browser.`
+          }]
+        };
+      }
+      case 'list_canvases': {
+        const includeDeleted = (args as any)?.includeDeleted !== false;
+        const scenes = await listCanvases(includeDeleted);
+        return {
+          content: [{
+            type: 'text',
+            text: `Canvases (${scenes.length}):\n\n${JSON.stringify(scenes, null, 2)}`
+          }]
+        };
+      }
+      case 'delete_canvas': {
+        const name2 = typeof (args as any)?.name === 'string' ? (args as any).name.trim() : '';
+        if (!name2) throw new Error('Canvas name is required');
+        const restore = (args as any)?.restore === true;
+        const purge = (args as any)?.purge === true;
+        if (restore) {
+          const scene = await restoreCanvasOnServer(name2);
+          return { content: [{ type: 'text', text: `Canvas "${name2}" restored from recycle bin.\n\n${JSON.stringify(scene, null, 2)}` }] };
+        }
+        const result = await deleteCanvasOnServer(name2, purge);
+        return {
+          content: [{
+            type: 'text',
+            text: result.purged
+              ? `Canvas "${name2}" permanently purged (data wiped).`
+              : `Canvas "${name2}" moved to recycle bin (data kept; restore with restore:true, or purge:true to wipe).`
+          }]
+        };
+      }
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
+    });
   } catch (error) {
     logger.error(`Error handling tool call: ${(error as Error).message}`, { error });
     return {

@@ -8,9 +8,6 @@ import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import logger from './utils/logger.js';
 import {
-  elements,
-  files,
-  snapshots,
   generateId,
   EXCALIDRAW_ELEMENT_TYPES,
   ServerElement,
@@ -33,6 +30,17 @@ import { writePidFile, removePidFile } from './core/pidfile.js';
 import { mcpHttpEndpoint } from './core/mcp-http.js';
 import { hydratePersistence, flushPersistenceNow } from './core/persistence.js';
 import { requireToken, verifyWebSocketUpgrade } from './core/auth.js';
+import {
+  getSceneMaps,
+  listScenes,
+  createScene,
+  deleteScene,
+  restoreScene,
+  purgeScene,
+  isValidSceneName,
+  DEFAULT_SCENE,
+  SceneMeta
+} from './core/scenes.js';
 
 // Load environment variables
 dotenv.config();
@@ -57,6 +65,18 @@ app.use(requireToken);
 app.use('/mcp', mcpHttpEndpoint);
 app.use(express.json({ limit: '10mb' }));
 
+// Scene-aware API mount: /api/s/<scene>/elements → /api/elements with res.locals.scene set.
+// Legacy /api/* calls skip this and fall through to the default scene.
+const SCENE_URL_RE = /^\/api\/s\/([a-zA-Z0-9_-]{1,64})(\/.*)?$/;
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const m = SCENE_URL_RE.exec(req.url);
+  if (m) {
+    res.locals.scene = m[1];
+    req.url = '/api' + (m[2] || '');
+  }
+  next();
+});
+
 // Serve static files from the build directory
 const staticDir = path.join(__dirname, '../dist');
 app.use(express.static(staticDir));
@@ -69,11 +89,17 @@ app.use('/assets/fonts', express.static(
 
 // WebSocket connections
 const clients = new Set<WebSocket>();
+const wsScene = new Map<WebSocket, string>();
 
-// Broadcast to all connected clients
-function broadcast(message: WebSocketMessage): void {
+function sceneOf(res: Response): string {
+  return (res.locals.scene as string | undefined) || DEFAULT_SCENE;
+}
+
+// Broadcast to clients watching the given scene (default when omitted)
+function broadcast(message: WebSocketMessage, scene: string = DEFAULT_SCENE): void {
   const data = JSON.stringify(message);
   clients.forEach(client => {
+    if (wsScene.get(client) !== scene) return;
     try {
       if (client.readyState === WebSocket.OPEN) {
         client.send(data);
@@ -92,11 +118,16 @@ function normalizeLineBreakMarkup(text: string): string {
 }
 
 // WebSocket connection handling
-wss.on('connection', (ws: WebSocket) => {
+wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
   clients.add(ws);
-  logger.info('New WebSocket connection established');
+  const q = (req.url || '').split('?')[1] || '';
+  const sceneParam = new URLSearchParams(q).get('scene');
+  const scene = sceneParam && isValidSceneName(sceneParam) ? sceneParam : DEFAULT_SCENE;
+  wsScene.set(ws, scene);
+  logger.info(`New WebSocket connection established (scene=${scene})`);
 
-  // Send current elements to new client
+  // Send current elements to new client (scene-scoped)
+  const { elements, files } = getSceneMaps(scene);
   const filesObj: Record<string, ExcalidrawFile> = {};
   files.forEach((f, id) => { filesObj[id] = f; });
   const initialMessage: InitialElementsMessage & { files?: Record<string, ExcalidrawFile> } = {
@@ -116,12 +147,14 @@ wss.on('connection', (ws: WebSocket) => {
 
   ws.on('close', () => {
     clients.delete(ws);
+    wsScene.delete(ws);
     logger.info('WebSocket connection closed');
   });
 
   ws.on('error', (error) => {
     logger.error('WebSocket error:', error);
     clients.delete(ws);
+    wsScene.delete(ws);
   });
 });
 
@@ -264,6 +297,7 @@ const UpdateElementSchema = z.object({
 // Get all elements
 app.get('/api/elements', (req: Request, res: Response) => {
   try {
+    const { elements } = getSceneMaps(sceneOf(res));
     const elementsArray = Array.from(elements.values());
     res.json({
       success: true,
@@ -282,6 +316,7 @@ app.get('/api/elements', (req: Request, res: Response) => {
 // Create new element
 app.post('/api/elements', (req: Request, res: Response) => {
   try {
+    const { elements } = getSceneMaps(sceneOf(res));
     const params = CreateElementSchema.parse(req.body);
     logger.info('Creating element via API', { type: params.type });
 
@@ -298,7 +333,7 @@ app.post('/api/elements', (req: Request, res: Response) => {
 
     // Resolve arrow bindings against existing elements
     if (element.type === 'arrow' || element.type === 'line') {
-      resolveArrowBindings([element]);
+      resolveArrowBindings([element], elements);
     }
 
     elements.set(id, element);
@@ -308,7 +343,7 @@ app.post('/api/elements', (req: Request, res: Response) => {
       type: 'element_created',
       element: element
     };
-    broadcast(message);
+    broadcast(message, sceneOf(res));
 
     res.json({
       success: true,
@@ -326,6 +361,7 @@ app.post('/api/elements', (req: Request, res: Response) => {
 // Update element
 app.put('/api/elements/:id', (req: Request, res: Response) => {
   try {
+    const { elements } = getSceneMaps(sceneOf(res));
     const { id } = req.params;
     const body = req.body && typeof req.body === 'object' ? req.body : {};
     const updates = UpdateElementSchema.parse({ id, ...body });
@@ -384,14 +420,14 @@ app.put('/api/elements/:id', (req: Request, res: Response) => {
       type: 'element_updated',
       element: updatedElement
     };
-    broadcast(message);
+    broadcast(message, sceneOf(res));
 
     // Moving/resizing a shape must drag its bound arrows along
     const geometryChanged = ['x', 'y', 'width', 'height']
       .some(key => Object.prototype.hasOwnProperty.call(body, key));
     if (geometryChanged && updatedElement.type !== 'arrow' && updatedElement.type !== 'line') {
-      for (const arrow of rerouteBoundArrows(id)) {
-        broadcast({ type: 'element_updated', element: arrow } as ElementUpdatedMessage);
+      for (const arrow of rerouteBoundArrows(id, elements)) {
+        broadcast({ type: 'element_updated', element: arrow } as ElementUpdatedMessage, sceneOf(res));
       }
     }
 
@@ -411,13 +447,14 @@ app.put('/api/elements/:id', (req: Request, res: Response) => {
 // Clear all elements (must be before /:id route)
 app.delete('/api/elements/clear', (req: Request, res: Response) => {
   try {
+    const { elements } = getSceneMaps(sceneOf(res));
     const count = elements.size;
     elements.clear();
 
     broadcast({
       type: 'canvas_cleared',
       timestamp: new Date().toISOString()
-    });
+    }, sceneOf(res));
 
     logger.info(`Canvas cleared: ${count} elements removed`);
 
@@ -438,6 +475,7 @@ app.delete('/api/elements/clear', (req: Request, res: Response) => {
 // Delete element
 app.delete('/api/elements/:id', (req: Request, res: Response) => {
   try {
+    const { elements } = getSceneMaps(sceneOf(res));
     const { id } = req.params;
 
     if (!id) {
@@ -461,7 +499,7 @@ app.delete('/api/elements/:id', (req: Request, res: Response) => {
       type: 'element_deleted',
       elementId: id!
     };
-    broadcast(message);
+    broadcast(message, sceneOf(res));
 
     res.json({
       success: true,
@@ -479,6 +517,7 @@ app.delete('/api/elements/:id', (req: Request, res: Response) => {
 // Query elements with filters
 app.get('/api/elements/search', (req: Request, res: Response) => {
   try {
+    const { elements } = getSceneMaps(sceneOf(res));
     const { type, x_min, x_max, y_min, y_max, ...filters } = req.query;
     let results = Array.from(elements.values());
 
@@ -528,6 +567,7 @@ app.get('/api/elements/search', (req: Request, res: Response) => {
 // Get element by ID
 app.get('/api/elements/:id', (req: Request, res: Response) => {
   try {
+    const { elements } = getSceneMaps(sceneOf(res));
     const { id } = req.params;
 
     if (!id) {
@@ -612,12 +652,12 @@ function computeEdgePoint(
 }
 
 // Helper: resolve arrow bindings in a batch
-function resolveArrowBindings(batchElements: ServerElement[]): void {
+function resolveArrowBindings(batchElements: ServerElement[], source: Map<string, ServerElement>): void {
   const elementMap = new Map<string, ServerElement>();
   batchElements.forEach(el => elementMap.set(el.id, el));
 
   // Also check existing elements for cross-batch references
-  elements.forEach((el, id) => {
+  source.forEach((el, id) => {
     if (!elementMap.has(id)) elementMap.set(id, el);
   });
 
@@ -679,14 +719,14 @@ function resolveArrowBindings(batchElements: ServerElement[]): void {
 // visual connection follows the shape — bindings are otherwise only resolved
 // at creation time, which left arrows floating at stale coordinates when
 // update/align/distribute moved their endpoints. Returns the re-routed arrows.
-function rerouteBoundArrows(movedId: string): ServerElement[] {
+function rerouteBoundArrows(movedId: string, source: Map<string, ServerElement>): ServerElement[] {
   const rerouted: ServerElement[] = [];
-  elements.forEach(el => {
+  source.forEach(el => {
     if (el.type !== 'arrow' && el.type !== 'line') return;
     const startRef = (el as any).start as { id: string } | undefined;
     const endRef = (el as any).end as { id: string } | undefined;
     if (startRef?.id !== movedId && endRef?.id !== movedId) return;
-    resolveArrowBindings([el]);
+    resolveArrowBindings([el], source);
     el.updatedAt = new Date().toISOString();
     el.version = (el.version || 0) + 1;
     rerouted.push(el);
@@ -697,6 +737,7 @@ function rerouteBoundArrows(movedId: string): ServerElement[] {
 // Batch create elements
 app.post('/api/elements/batch', (req: Request, res: Response) => {
   try {
+    const { elements } = getSceneMaps(sceneOf(res));
     const { elements: elementsToCreate } = req.body;
 
     if (!Array.isArray(elementsToCreate)) {
@@ -725,7 +766,7 @@ app.post('/api/elements/batch', (req: Request, res: Response) => {
     });
 
     // Resolve arrow bindings (computes positions, startBinding, endBinding, boundElements)
-    resolveArrowBindings(createdElements);
+    resolveArrowBindings(createdElements, elements);
 
     // Store all elements after binding resolution
     createdElements.forEach(el => elements.set(el.id, el));
@@ -735,7 +776,7 @@ app.post('/api/elements/batch', (req: Request, res: Response) => {
       type: 'elements_batch_created',
       elements: createdElements
     };
-    broadcast(message);
+    broadcast(message, sceneOf(res));
 
     res.json({
       success: true,
@@ -774,7 +815,7 @@ app.post('/api/elements/from-mermaid', (req: Request, res: Response) => {
       mermaidDiagram,
       config: config || {},
       timestamp: new Date().toISOString()
-    });
+    }, sceneOf(res));
 
     // Return the diagram for frontend processing
     res.json({
@@ -795,6 +836,7 @@ app.post('/api/elements/from-mermaid', (req: Request, res: Response) => {
 // Sync elements from frontend (overwrite sync)
 app.post('/api/elements/sync', (req: Request, res: Response) => {
   try {
+    const { elements } = getSceneMaps(sceneOf(res));
     const { elements: frontendElements, timestamp } = req.body;
 
     logger.info(`Sync request received: ${frontendElements.length} elements`, {
@@ -854,7 +896,7 @@ app.post('/api/elements/sync', (req: Request, res: Response) => {
       count: successCount,
       timestamp: new Date().toISOString(),
       source: 'manual_sync'
-    });
+    }, sceneOf(res));
 
     // 4. Return sync results
     res.json({
@@ -879,6 +921,7 @@ app.post('/api/elements/sync', (req: Request, res: Response) => {
 // ─── Files API (for image elements) ───────────────────────────
 // GET all files
 app.get('/api/files', (_req: Request, res: Response) => {
+  const { files } = getSceneMaps(sceneOf(res));
   const filesObj: Record<string, ExcalidrawFile> = {};
   files.forEach((f, id) => { filesObj[id] = f; });
   res.json({ files: filesObj });
@@ -886,6 +929,7 @@ app.get('/api/files', (_req: Request, res: Response) => {
 
 // POST add/update files (batch)
 app.post('/api/files', (req: Request, res: Response) => {
+  const { files } = getSceneMaps(sceneOf(res));
   const body = req.body;
   const fileList: ExcalidrawFile[] = Array.isArray(body) ? body : (body?.files || []);
   for (const f of fileList) {
@@ -894,15 +938,16 @@ app.post('/api/files', (req: Request, res: Response) => {
     }
   }
   // Broadcast files to connected clients
-  broadcast({ type: 'files_added', files: fileList });
+  broadcast({ type: 'files_added', files: fileList }, sceneOf(res));
   res.json({ success: true, count: fileList.length });
 });
 
 // DELETE a file
 app.delete('/api/files/:id', (req: Request, res: Response) => {
+  const { files } = getSceneMaps(sceneOf(res));
   const id = req.params.id as string;
   if (files.delete(id)) {
-    broadcast({ type: 'file_deleted', fileId: id });
+    broadcast({ type: 'file_deleted', fileId: id }, sceneOf(res));
     res.json({ success: true });
   } else {
     res.status(404).json({ success: false, error: `File with ID ${id} not found` });
@@ -921,6 +966,8 @@ const pendingExports = new Map<string, PendingExport>();
 
 app.post('/api/export/image', (req: Request, res: Response) => {
   try {
+    const scene = sceneOf(res);
+    const { elements, files } = getSceneMaps(scene);
     const { format, background } = req.body;
 
     if (!format || !['png', 'svg'].includes(format)) {
@@ -930,10 +977,12 @@ app.post('/api/export/image', (req: Request, res: Response) => {
       });
     }
 
-    if (clients.size === 0) {
+    let sceneClients = 0;
+    clients.forEach(c => { if (wsScene.get(c) === scene) sceneClients++; });
+    if (sceneClients === 0) {
       return res.status(503).json({
         success: false,
-        error: 'No frontend client connected. Open the canvas in a browser first.'
+        error: `No frontend client connected to scene "${scene}". Open the canvas in a browser first.`
       });
     }
 
@@ -962,7 +1011,7 @@ app.post('/api/export/image', (req: Request, res: Response) => {
       type: 'initial_elements',
       elements: Array.from(elements.values()),
       ...(files.size > 0 ? { files: filesObj } : {})
-    } as InitialElementsMessage & { files?: Record<string, ExcalidrawFile> });
+    } as InitialElementsMessage & { files?: Record<string, ExcalidrawFile> }, scene);
 
     // Give browsers time to process the reload before requesting export
     setTimeout(() => {
@@ -971,7 +1020,7 @@ app.post('/api/export/image', (req: Request, res: Response) => {
         requestId,
         format,
         background: background ?? true
-      });
+      }, scene);
     }, 800);
 
     exportPromise
@@ -1091,6 +1140,7 @@ const viewportRequestSchema = z.object({
 
 app.post('/api/viewport', (req: Request, res: Response) => {
   try {
+    const scene = sceneOf(res);
     const {
       scrollToContent,
       scrollToElementIds,
@@ -1101,10 +1151,12 @@ app.post('/api/viewport', (req: Request, res: Response) => {
       offsetY
     } = viewportRequestSchema.parse(req.body);
 
-    if (clients.size === 0) {
+    let sceneClients = 0;
+    clients.forEach(c => { if (wsScene.get(c) === scene) sceneClients++; });
+    if (sceneClients === 0) {
       return res.status(503).json({
         success: false,
-        error: 'No frontend client connected. Open the canvas in a browser first.'
+        error: `No frontend client connected to scene "${scene}". Open the canvas in a browser first.`
       });
     }
 
@@ -1129,7 +1181,7 @@ app.post('/api/viewport', (req: Request, res: Response) => {
       zoom,
       offsetX,
       offsetY
-    });
+    }, scene);
 
     viewportPromise
       .then(result => {
@@ -1193,6 +1245,7 @@ app.post('/api/viewport/result', (req: Request, res: Response) => {
 // Snapshots: save
 app.post('/api/snapshots', (req: Request, res: Response) => {
   try {
+    const { elements, snapshots } = getSceneMaps(sceneOf(res));
     const { name } = req.body;
 
     if (!name || typeof name !== 'string') {
@@ -1229,6 +1282,7 @@ app.post('/api/snapshots', (req: Request, res: Response) => {
 // Snapshots: list
 app.get('/api/snapshots', (req: Request, res: Response) => {
   try {
+    const { snapshots } = getSceneMaps(sceneOf(res));
     const list = Array.from(snapshots.values()).map(s => ({
       name: s.name,
       elementCount: s.elements.length,
@@ -1252,6 +1306,7 @@ app.get('/api/snapshots', (req: Request, res: Response) => {
 // Snapshots: get by name
 app.get('/api/snapshots/:name', (req: Request, res: Response) => {
   try {
+    const { snapshots } = getSceneMaps(sceneOf(res));
     const { name } = req.params;
     const snapshot = snapshots.get(name!);
 
@@ -1276,14 +1331,68 @@ app.get('/api/snapshots/:name', (req: Request, res: Response) => {
 });
 
 // Serve the frontend
-app.get('/', (req: Request, res: Response) => {
-  const htmlFile = path.join(__dirname, '../dist/frontend/index.html');
-  res.sendFile(htmlFile, (err) => {
+const FRONTEND_INDEX = path.join(__dirname, '../dist/frontend/index.html');
+function serveFrontend(res: Response): void {
+  res.sendFile(FRONTEND_INDEX, (err) => {
     if (err) {
       logger.error('Error serving frontend:', err);
       res.status(404).send('Frontend not found. Please run "npm run build" first.');
     }
   });
+}
+app.get('/', (req: Request, res: Response) => {
+  serveFrontend(res);
+});
+
+// ─── Scenes API (multi-canvas lifecycle) ───────────────────────
+app.get('/api/scenes', (req: Request, res: Response) => {
+  const includeDeleted = req.query.includeDeleted !== 'false';
+  res.json({ success: true, scenes: listScenes({ includeDeleted }), count: listScenes({ includeDeleted }).length });
+});
+
+app.post('/api/scenes', (req: Request, res: Response) => {
+  try {
+    const { name } = req.body || {};
+    if (typeof name !== 'string' || !isValidSceneName(name)) {
+      return res.status(400).json({ success: false, error: `Invalid scene name (expected ^[a-zA-Z0-9_-]{1,64}$)` });
+    }
+    const { meta, created } = createScene(name);
+    if (!created) {
+      return res.status(409).json({ success: false, error: `Scene "${name}" already exists`, scene: meta });
+    }
+    logger.info(`Scene created: "${name}"`);
+    res.status(201).json({ success: true, scene: meta });
+  } catch (error) {
+    res.status(400).json({ success: false, error: (error as Error).message });
+  }
+});
+
+app.delete('/api/scenes/:name', (req: Request, res: Response) => {
+  try {
+    const { name } = req.params;
+    if (req.query.purge === '1' || req.query.purge === 'true') {
+      purgeScene(name!);
+      logger.info(`Scene purged (hard delete): "${name}"`);
+      return res.json({ success: true, purged: true, name });
+    }
+    const meta = deleteScene(name!);
+    logger.info(`Scene soft-deleted to recycle bin: "${name}"`);
+    res.json({ success: true, purged: false, scene: meta });
+  } catch (error) {
+    const msg = (error as Error).message;
+    res.status(msg.includes('not found') ? 404 : msg.includes('default') ? 403 : 400).json({ success: false, error: msg });
+  }
+});
+
+app.post('/api/scenes/:name/restore', (req: Request, res: Response) => {
+  try {
+    const meta = restoreScene(req.params.name!);
+    logger.info(`Scene restored from recycle bin: "${req.params.name}"`);
+    res.json({ success: true, scene: meta });
+  } catch (error) {
+    const msg = (error as Error).message;
+    res.status(msg.includes('not found') ? 404 : 400).json({ success: false, error: msg });
+  }
 });
 
 // Health check endpoint
@@ -1291,7 +1400,8 @@ app.get('/health', (req: Request, res: Response) => {
   res.json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
-    elements_count: elements.size,
+    elements_count: getSceneMaps(DEFAULT_SCENE).elements.size,
+    scenes_count: listScenes({ includeDeleted: false }).length,
     websocket_clients: clients.size,
     // Identity for `stop`: it must only ever signal a process that both
     // identifies as this service AND self-reports its pid — never a pid
@@ -1303,16 +1413,27 @@ app.get('/health', (req: Request, res: Response) => {
 
 // Sync status endpoint
 app.get('/api/sync/status', (req: Request, res: Response) => {
+  const { elements } = getSceneMaps(sceneOf(res));
+  let sceneClients = 0;
+  clients.forEach(c => { if (wsScene.get(c) === sceneOf(res)) sceneClients++; });
   res.json({
     success: true,
+    scene: sceneOf(res),
     elementCount: elements.size,
     timestamp: new Date().toISOString(),
     memoryUsage: {
       heapUsed: Math.round(process.memoryUsage().heapUsed / 1024 / 1024), // MB
       heapTotal: Math.round(process.memoryUsage().heapTotal / 1024 / 1024), // MB
     },
-    websocketClients: clients.size
+    websocketClients: sceneClients
   });
+});
+
+// SPA route: /<scene> serves the frontend for that canvas (App.tsx reads the
+// path). MUST stay after every API route — it catches any single-segment GET.
+app.get('/:scene', (req: Request, res: Response) => {
+  if (!isValidSceneName(req.params.scene ?? '')) return serveFrontend(res); // unknown single-segment paths → default UI
+  serveFrontend(res);
 });
 
 // Error handling middleware

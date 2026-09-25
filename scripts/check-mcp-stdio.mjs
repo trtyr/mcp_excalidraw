@@ -49,7 +49,7 @@ function assertEqual(actual, expected, message) {
  * Runs one stdio connection: sends every message, resolves once `expected`
  * responses have come back on stdout.
  */
-function exchange(messages, expected) {
+function exchange(messages, expected, extraEnv = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(runtime, runtimeArgs, {
       cwd: repoRoot,
@@ -57,7 +57,8 @@ function exchange(messages, expected) {
         ...process.env,
         ENABLE_CANVAS_SYNC: 'false',
         EXCALIDRAW_NO_AUTOSTART: '1',
-        LOG_LEVEL: 'error'
+        LOG_LEVEL: 'error',
+        ...extraEnv
       },
       stdio: ['pipe', 'pipe', 'pipe']
     });
@@ -156,6 +157,8 @@ async function checkDiscovery() {
 
 async function checkDirectCallWithoutInitialization() {
   // No initialize, no server/discover: the envelope alone opens the connection.
+  // Surface-pinned to the legacy 26-tool list: these are wire-protocol checks,
+  // and the default (progressive) surface is covered by its own check below.
   const { responses } = await exchange([
     { jsonrpc: '2.0', id: 1, method: 'tools/list', params: { _meta: envelope() } },
     {
@@ -164,7 +167,7 @@ async function checkDirectCallWithoutInitialization() {
       method: 'tools/call',
       params: { name: CANVAS_FREE_TOOL, arguments: {}, _meta: envelope() }
     }
-  ], 2);
+  ], 2, { EXCALIDRAW_LEGACY_TOOLS: '1' });
 
   const listResult = resultOf(responses.find(r => r.id === 1), 'tools/list');
   assert(Array.isArray(listResult.tools) && listResult.tools.length > 0, 'tools/list: expected a non-empty tool list');
@@ -233,7 +236,7 @@ async function checkLegacyInitialize() {
     { jsonrpc: '2.0', method: 'notifications/initialized' },
     { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
     { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: CANVAS_FREE_TOOL, arguments: {} } }
-  ], 3);
+  ], 3, { EXCALIDRAW_LEGACY_TOOLS: '1' });
 
   const initResult = resultOf(responses.find(r => r.id === 1), 'initialize');
   assertEqual(initResult.protocolVersion, LEGACY_VERSION, 'initialize: negotiated protocol version');
@@ -252,9 +255,40 @@ async function checkLegacyInitialize() {
   assert(callResult.resultType === undefined, 'legacy tools/call: 2025-era results must not carry resultType');
 }
 
+// Default surface is the single progressive `excalidraw` tool; a canvas-free
+// tool is reachable through action routing, and the scene selector is
+// documented on every legacy tool manual (action="help").
+async function checkProgressiveSurface() {
+  const { responses } = await exchange([
+    { jsonrpc: '2.0', id: 1, method: 'tools/list', params: { _meta: envelope() } },
+    {
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'tools/call',
+      params: {
+        name: 'excalidraw',
+        arguments: { action: CANVAS_FREE_TOOL, payload: {} },
+        _meta: envelope()
+      }
+    }
+  ], 2);
+
+  const listResult = resultOf(responses.find(r => r.id === 1), 'progressive tools/list');
+  const names = (listResult.tools || []).map(t => t.name);
+  assertEqual(listResult.tools.length, 1, 'progressive tools/list: exactly one tool by default');
+  assertEqual(names[0], 'excalidraw', 'progressive tools/list: tool name');
+  assertModernResult(listResult, 'progressive tools/list');
+  assertCacheFields(listResult, 'progressive tools/list');
+
+  const callResult = resultOf(responses.find(r => r.id === 2), 'progressive tools/call');
+  assert(callResult.isError !== true, `progressive tools/call: tool reported an error: ${JSON.stringify(callResult.content)}`);
+  assertEqual(callResult.content?.[0]?.type, 'text', 'progressive tools/call: first content block type');
+}
+
 const checks = [
   ['server/discover advertises the modern era', checkDiscovery],
   ['direct tool calls work without initialization', checkDirectCallWithoutInitialization],
+  ['progressive surface routes action calls', checkProgressiveSurface],
   ['unsupported protocol revisions are refused', checkUnsupportedVersion],
   ['malformed _meta envelopes are refused', checkInvalidEnvelope],
   [`legacy ${LEGACY_VERSION} initialize still works`, checkLegacyInitialize]

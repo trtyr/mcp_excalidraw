@@ -28,6 +28,7 @@ const DOMAINS: Domain[] = [
   { name: 'scene', summary: 'see the canvas: structured description + screenshot', tools: ['describe_scene', 'get_canvas_screenshot'] },
   { name: 'canvas', summary: 'viewport, snapshots, clear', tools: ['set_viewport', 'snapshot_scene', 'restore_snapshot', 'clear_canvas'] },
   { name: 'io', summary: 'files & formats: export/import scene, images, mermaid, share URLs', tools: ['export_scene', 'import_scene', 'export_to_image', 'export_to_excalidraw_url', 'create_from_mermaid'] },
+  { name: 'lifecycle', summary: 'multi-canvas: create/list/delete canvases; every tool takes an optional scene arg to target one', tools: ['create_canvas', 'list_canvases', 'delete_canvas'] },
   { name: 'guide', summary: 'design guidance & resources', tools: ['read_diagram_guide', 'get_resource'] }
 ];
 
@@ -47,6 +48,7 @@ function discoverText(): string {
     '  action="help", payload={"tool":"create_element"}  → full parameter manual for one tool',
     '  action="help", payload={"domain":"element"}       → manuals for a whole domain',
     '  action="<tool_name>", payload={...arguments}      → execute a tool directly',
+    'Multi-canvas: any tool accepts scene:"<name>" to target that canvas (omit = default); open /<name> in a browser.',
     'Typical loop: create_element(s) → describe_scene → fix overlaps/truncation → export_scene.'
   ];
   return lines.join('\n');
