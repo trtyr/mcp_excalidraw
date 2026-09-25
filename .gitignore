@@ -27,3 +27,7 @@ docs/
 # Browser regression artifacts
 test-results/
 playwright-report/
+
+# Local agent tooling
+.codegraph/
+.pi/
