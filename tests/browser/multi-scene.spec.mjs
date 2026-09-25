@@ -79,10 +79,26 @@ test.describe('multi-canvas', () => {
   test('per-scene persistence across reload', async ({ browser, request }) => {
     const ctx = await browser.newContext();
     const page = await ctx.newPage();
+
+    // After reload the scene may arrive via WS initial_elements — the HTTP
+    // fallback is intentionally skipped when WS wins the race (App.tsx
+    // sceneLoadStatus guard). Assert on the WS signal, not an HTTP request.
+    let sawInitial = false;
+    await page.routeWebSocket('**', socket => {
+      const upstream = socket.connectToServer();
+      upstream.onMessage(message => {
+        if (JSON.parse(String(message)).type === 'initial_elements') sawInitial = true;
+        socket.send(message);
+      });
+      socket.onMessage(m => upstream.send(m));
+    });
+
     await page.goto(`/${SCENE}`);
-    await page.waitForResponse(r => r.url().includes(`/api/s/${SCENE}/elements`));
+    await expect.poll(() => sawInitial, { timeout: 10000 }).toBe(true);
+
+    sawInitial = false;
     await page.reload();
-    await page.waitForResponse(r => r.url().includes(`/api/s/${SCENE}/elements`));
+    await expect.poll(() => sawInitial, { timeout: 10000 }).toBe(true);
 
     const res = await request.get(`/api/s/${SCENE}/elements`);
     const scene = await res.json();
